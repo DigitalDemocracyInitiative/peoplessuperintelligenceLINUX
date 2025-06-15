@@ -1,16 +1,42 @@
-import React, { useState, FormEvent, ChangeEvent } from 'react';
+import React, { useState, FormEvent, ChangeEvent, useEffect } from 'react';
 import axios from 'axios';
 import './App.css'; // Assuming create-react-app made this
 
 interface Message {
+  id?: number; // Optional, as it might not be present for new messages
   text: string;
-  sender: 'user' | 'ai';
+  sender: 'user' | 'ai' | 'system-info'; // Added 'system-info'
+  timestamp?: string; // Optional, for messages from history
 }
 
 function App() {
   const [messages, setMessages] = useState<Message[]>([]);
   const [input, setInput] = useState<string>('');
   const [loading, setLoading] = useState<boolean>(false);
+
+  useEffect(() => {
+    const fetchHistory = async () => {
+      console.log("Fetching chat history...");
+      setLoading(true);
+      try {
+        const response = await axios.get<Message[]>('http://localhost:5000/api/history');
+        // Assuming backend returns messages in chronological order (timestamp asc)
+        setMessages(response.data);
+      } catch (error) {
+        console.error('Error fetching chat history:', error);
+        // Add a system message to the chat indicating failure
+        const historyErrorMsg: Message = {
+          text: 'Failed to load chat history. Previous messages may not be available.',
+          sender: 'system-info'
+        };
+        setMessages(prev => [...prev, historyErrorMsg]);
+      } finally {
+        setLoading(false);
+      }
+    };
+
+    fetchHistory();
+  }, []); // Empty dependency array ensures this runs only once on mount
 
   const handleSendMessage = async (e: FormEvent) => {
     e.preventDefault();
@@ -60,11 +86,13 @@ function App() {
       <div className="chat-container">
         <div className="messages-display">
           {messages.map((msg, index) => (
-            <div key={index} className={`message ${msg.sender}`}>
-              <strong>{msg.sender === 'user' ? 'You' : 'AI'}:</strong> {msg.text}
+            <div key={msg.id || index} className={`message ${msg.sender}`}>
+              <strong>{msg.sender === 'user' ? 'You' : msg.sender === 'ai' ? 'AI' : 'System'}:</strong> {msg.text}
+              {msg.timestamp && <span className="timestamp">{new Date(msg.timestamp).toLocaleTimeString()}</span>}
             </div>
           ))}
-          {loading && <div className="message ai"><strong>AI:</strong> Thinking...</div>}
+          {loading && messages.length === 0 && <div className="message system-info"><strong>System:</strong> Loading history...</div>}
+          {loading && messages.length > 0 && <div className="message ai"><strong>AI:</strong> Thinking...</div>}
         </div>
         <form onSubmit={handleSendMessage} className="message-input-form">
           <input
@@ -72,9 +100,9 @@ function App() {
             value={input}
             onChange={handleInputChange}
             placeholder="Type your message..."
-            disabled={loading}
+            disabled={loading && messages.length > 0}
           />
-          <button type="submit" disabled={loading}>Send</button>
+          <button type="submit" disabled={loading && messages.length > 0}>Send</button>
         </form>
       </div>
     </div>
