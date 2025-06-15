@@ -52,7 +52,19 @@ function App() {
       const response = await axios.post('http://localhost:5000/api/chat', {
         message: currentInput, // Use captured input
       });
-      const aiMessage: Message = { text: response.data.response, sender: 'ai' };
+
+      const agentAction = response.data.agent_action;
+      const responseText = response.data.response;
+
+      const aiMessage: Message = {
+        text: responseText,
+        sender: 'ai'
+      };
+
+      if (agentAction && typeof agentAction === 'string' && agentAction.startsWith('file_')) {
+        aiMessage.text = `[File Tool] ${responseText}`;
+      }
+
       setMessages((prevMessages) => [...prevMessages, aiMessage]);
     } catch (error) {
       console.error('Error sending message to backend:', error);
