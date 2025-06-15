@@ -1,3 +1,14 @@
+#!/bin/bash
+set -e
+
+echo ">>> Navigating to project root..."
+cd ~/psi_pwa_linux_new || { echo "Failed to navigate to project root. Exiting."; exit 1; }
+
+echo ">>> Creating agent_workspace directory..."
+mkdir -p agent_workspace
+
+echo ">>> Overwriting backend/app.py..."
+cat <<'EOF_APP_PY' > backend/app.py
 import os
 import re # Import re for potential future use, even if not immediately used
 from flask import Flask, request, jsonify
@@ -288,3 +299,182 @@ def write_file_tool(file_path: str, content: str):
     except (IOError, OSError) as e:
         print(f"Error writing to file {full_path}: {e}")
         return "Error: Could not write to file due to system error."
+EOF_APP_PY
+
+echo ">>> Overwriting frontend/src/App.tsx..."
+cat <<'EOF_APP_TSX' > frontend/src/App.tsx
+import React, { useState, FormEvent, ChangeEvent, useEffect } from 'react';
+import axios from 'axios';
+import './App.css'; // Assuming create-react-app made this
+
+interface Message {
+  id?: number; // Optional, as it might not be present for new messages
+  text: string;
+  sender: 'user' | 'ai' | 'system-info'; // Added 'system-info'
+  timestamp?: string; // Optional, for messages from history
+}
+
+function App() {
+  const [messages, setMessages] = useState<Message[]>([]);
+  const [input, setInput] = useState<string>('');
+  const [loading, setLoading] = useState<boolean>(false);
+
+  useEffect(() => {
+    const fetchHistory = async () => {
+      console.log("Fetching chat history...");
+      setLoading(true);
+      try {
+        const response = await axios.get<Message[]>('http://localhost:5000/api/history');
+        // Assuming backend returns messages in chronological order (timestamp asc)
+        setMessages(response.data);
+      } catch (error) {
+        console.error('Error fetching chat history:', error);
+        // Add a system message to the chat indicating failure
+        const historyErrorMsg: Message = {
+          text: 'Failed to load chat history. Previous messages may not be available.',
+          sender: 'system-info'
+        };
+        setMessages(prev => [...prev, historyErrorMsg]);
+      } finally {
+        setLoading(false);
+      }
+    };
+
+    fetchHistory();
+  }, []); // Empty dependency array ensures this runs only once on mount
+
+  const handleSendMessage = async (e: FormEvent) => {
+    e.preventDefault();
+    if (input.trim() === '') return;
+
+    const userMessage: Message = { text: input, sender: 'user' };
+    setMessages((prevMessages) => [...prevMessages, userMessage]);
+    const currentInput = input; // Capture current input before clearing
+    setInput('');
+    setLoading(true);
+
+    try {
+      const response = await axios.post('http://localhost:5000/api/chat', {
+        message: currentInput, // Use captured input
+      });
+
+      const agentAction = response.data.agent_action;
+      const responseText = response.data.response;
+
+      const aiMessage: Message = {
+        text: responseText,
+        sender: 'ai'
+      };
+
+      if (agentAction && typeof agentAction === 'string' && agentAction.startsWith('file_')) {
+        aiMessage.text = `[File Tool] ${responseText}`;
+      }
+
+      setMessages((prevMessages) => [...prevMessages, aiMessage]);
+    } catch (error) {
+      console.error('Error sending message to backend:', error);
+      let errorMessageText = 'Error: Could not get response from AI. Check backend (http://localhost:5000) and Ollama (http://localhost:11434).';
+      if (axios.isAxiosError(error) && error.response) {
+        // If backend provides a specific error message, prefer that.
+        errorMessageText = error.response.data.error || errorMessageText;
+      } else if (axios.isAxiosError(error) && error.request) {
+        // Network error or backend not reachable
+         errorMessageText = 'Error: Cannot connect to backend. Please ensure it is running.';
+      }
+      const errorMessage: Message = {
+        text: errorMessageText,
+        sender: 'ai',
+      };
+      setMessages((prevMessages) => [...prevMessages, errorMessage]);
+    } finally {
+      setLoading(false);
+    }
+  };
+
+  const handleInputChange = (e: ChangeEvent<HTMLInputElement>) => {
+    setInput(e.target.value);
+  };
+
+  return (
+    <div className="App">
+      <header className="App-header">
+        <h1>PSI AI Chat</h1>
+      </header>
+      <div className="chat-container">
+        <div className="messages-display">
+          {messages.map((msg, index) => (
+            <div key={msg.id || index} className={`message ${msg.sender}`}>
+              <strong>{msg.sender === 'user' ? 'You' : msg.sender === 'ai' ? 'AI' : 'System'}:</strong> {msg.text}
+              {msg.timestamp && <span className="timestamp">{new Date(msg.timestamp).toLocaleTimeString()}</span>}
+            </div>
+          ))}
+          {loading && messages.length === 0 && <div className="message system-info"><strong>System:</strong> Loading history...</div>}
+          {loading && messages.length > 0 && <div className="message ai"><strong>AI:</strong> Thinking...</div>}
+        </div>
+        <form onSubmit={handleSendMessage} className="message-input-form">
+          <input
+            type="text"
+            value={input}
+            onChange={handleInputChange}
+            placeholder="Type your message..."
+            disabled={loading && messages.length > 0}
+          />
+          <button type="submit" disabled={loading && messages.length > 0}>Send</button>
+        </form>
+      </div>
+    </div>
+  );
+}
+
+export default App;
+EOF_APP_TSX
+
+echo ">>> Activating Python virtual environment..."
+source backend/venv/bin/activate || { echo "Failed to activate Python venv. Check backend/venv. Exiting."; exit 1; }
+
+echo ">>> Starting Flask backend server..."
+nohup python backend/app.py > backend.log 2>&1 &
+echo "Backend server logs will be in backend.log"
+
+echo ">>> Starting React frontend server..."
+cd frontend || { echo "Failed to navigate to frontend directory. Exiting."; exit 1; }
+nohup npm start > ../frontend.log 2>&1 &
+cd .. || { echo "Failed to navigate back to project root. Exiting."; exit 1; } # Navigate back to root for consistency
+echo "Frontend server logs will be in frontend.log (in project root)"
+echo "Wait a few moments for the servers to initialize."
+
+echo "---------------------------------------------------------------------"
+echo "PSI PWA with File Management Tool Setup Complete!"
+echo "---------------------------------------------------------------------"
+echo ""
+echo "The backend and frontend servers have been started in the background."
+echo ""
+echo "Backend API server should be running on: http://localhost:5000"
+echo "Frontend React app should be accessible at: http://localhost:3000 (or the port indicated by npm)"
+echo ""
+echo "New File Management Capabilities:"
+echo "You can now instruct the agent to read and write files in its workspace."
+echo "Example prompts:"
+echo "  'write to my_notes.txt content This is a test note about project X.'"
+echo "  'read file my_notes.txt'"
+echo "  'show me content of my_notes.txt'"
+echo "  'save this to important_ideas.md: Start with a clear objective...'"
+echo ""
+echo "Important Notes:"
+echo "- Files are stored in the 'agent_workspace' directory within the project."
+echo "- Ensure Ollama (Mistral, Deepseek-coder) is running separately (http://localhost:11434)."
+echo "- Make sure you have run 'npm install' in the 'frontend' directory if you haven't already."
+echo ""
+echo "To check logs:"
+echo "  tail -f backend.log"
+echo "  tail -f frontend.log"
+echo ""
+echo "To stop the servers:"
+echo "  pkill -f 'python backend/app.py'"
+echo "  pkill -f 'npm start'" # Simplified pkill for npm start
+echo "  echo 'Servers stopped.'"
+echo ""
+echo "If you encounter issues, check backend.log and frontend.log for errors."
+echo "---------------------------------------------------------------------"
+
+echo "Script finished."
