@@ -1,491 +1,512 @@
-import requests
-import json
-from flask import Flask, request, jsonify, session
-from flask_cors import CORS
+# backend/app.py
+from flask import Flask, request, jsonify, send_from_directory
 from flask_sqlalchemy import SQLAlchemy
-from datetime import datetime
+from sqlalchemy import Column, Integer, String, Text, DateTime, ForeignKey, JSON
+from sqlalchemy.orm import relationship, declarative_base
+from sqlalchemy.sql import func
+import json
 import os
-import sys # Added for sys.path manipulation
+from werkzeug.utils import secure_filename
+from datetime import datetime
 import time
-import logging # Added for logging
+import threading
+import ollama
+from typing import List, Dict, Any, Optional, Union
+from pydantic import BaseModel, Field
+import inspect
 
-# --- Pre-Flask App Initialization ---
-
-# 1. Configure basic logging
-# Moved to be one of the first things to ensure logging is available early.
-logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
-
-# 2. Discover Tools
-# This needs to happen before the Flask app uses AVAILABLE_TOOLS or AVAILABLE_TOOL_SCHEMAS.
-tools_dir_path = os.path.join(os.path.dirname(__file__), "tools")
-
-# Add tools directory to sys.path to allow agent_core to import them
-if tools_dir_path not in sys.path:
-    sys.path.insert(0, tools_dir_path)
-    logging.info(f"Tools directory '{tools_dir_path}' added to sys.path.")
-
-try:
-    from agent_core import discover_tools
-    logging.info(f"Discovering tools from: {tools_dir_path}")
-    AVAILABLE_TOOLS_FUNCTIONS, AVAILABLE_TOOL_SCHEMAS = discover_tools(tools_dir_path)
-    logging.info(f"Discovered {len(AVAILABLE_TOOLS_FUNCTIONS)} tool functions.")
-    logging.debug(f"Tool Schemas: {json.dumps(AVAILABLE_TOOL_SCHEMAS, indent=2)}")
-except ImportError as e:
-    logging.error(f"Failed to import discover_tools from agent_core: {e}. Ensure agent_core.py is in the backend directory or PYTHONPATH.")
-    AVAILABLE_TOOLS_FUNCTIONS = {}
-    AVAILABLE_TOOL_SCHEMAS = {}
-except Exception as e:
-    logging.error(f"An error occurred during tool discovery: {e}")
-    AVAILABLE_TOOLS_FUNCTIONS = {}
-    AVAILABLE_TOOL_SCHEMAS = {}
-
-
-# --- Flask App Initialization ---
+# Initialize Flask app
 app = Flask(__name__)
-app.secret_key = os.getenv('FLASK_SECRET_KEY', 'your_super_secret_key_please_change_me_in_production')
-CORS(app, supports_credentials=True)
-
-# Database Configuration
-app.config['SQLALCHEMY_DATABASE_URI'] = os.getenv('DATABASE_URL', 'sqlite:///messages.db')
+app.config['SQLALCHEMY_DATABASE_URI'] = 'sqlite:///./test.db'
 app.config['SQLALCHEMY_TRACK_MODIFICATIONS'] = False
+app.config['UPLOAD_FOLDER'] = 'uploads'
+app.config['KNOWLEDGE_BASE_PATH'] = 'knowledge_base' # New
+
 db = SQLAlchemy(app)
 
-# --- Database Models ---
-class Message(db.Model):
-    id = db.Column(db.Integer, primary_key=True)
-    sender = db.Column(db.String(50), nullable=False) # 'user', 'ai', 'system-info', 'tool-result'
-    text = db.Column(db.Text, nullable=False)
-    timestamp = db.Column(db.DateTime, default=datetime.utcnow)
-    agent_action = db.Column(db.String(100), nullable=True) # e.g., 'llm_mistral', 'tool_read_file'
-    tool_input = db.Column(db.Text, nullable=True) # JSON string of tool arguments
-    tool_output = db.Column(db.Text, nullable=True) # JSON string of tool result or error
-
-    def to_dict(self):
-        return {
-            'id': self.id,
-            'sender': self.sender,
-            'text': self.text,
-            'timestamp': self.timestamp.isoformat() + 'Z', # ISO 8601 format with Z for UTC
-            'agent_action': self.agent_action,
-            'tool_input': self.tool_input,
-            'tool_output': self.tool_output,
-        }
+# --- SQLAlchemy Models ---
+Base = declarative_base()
 
 class AgentProfile(db.Model):
-    id = db.Column(db.Integer, primary_key=True)
-    name = db.Column(db.String(100), unique=True, nullable=False)
-    system_prompt_template = db.Column(db.Text, nullable=False) # Uses {tool_schemas}
-    description = db.Column(db.Text, nullable=True)
-    is_default = db.Column(db.Boolean, default=False)
+    __tablename__ = 'agent_profile'
+    id = Column(Integer, primary_key=True)
+    name = Column(String(100), nullable=False, default="Monarch Agent")
+    persona = Column(Text, nullable=False, default="You are a helpful AI assistant.")
+    tools = Column(JSON, nullable=True, default=[]) # Store tool definitions
+    current_task_id = Column(Integer, ForeignKey('background_task.id'), nullable=True)
+    current_task = relationship("BackgroundTask", foreign_keys=[current_task_id])
+    # New fields for agent state
+    state = Column(JSON, default={}) # General purpose state
+    created_at = Column(DateTime(timezone=True), server_default=func.now())
+    updated_at = Column(DateTime(timezone=True), onupdate=func.now())
 
-    def to_dict(self):
-        return {
-            'id': self.id,
-            'name': self.name,
-            'system_prompt_template': self.system_prompt_template,
-            'description': self.description,
-            'is_default': self.is_default
-        }
+class AgentState(db.Model): # New Model
+    __tablename__ = 'agent_state'
+    id = Column(Integer, primary_key=True)
+    key = Column(String(100), nullable=False, unique=True)
+    value = Column(JSON, nullable=True)
+    created_at = Column(DateTime(timezone=True), server_default=func.now())
+    updated_at = Column(DateTime(timezone=True), onupdate=func.now())
 
-def init_db():
-    with app.app_context():
-        db.create_all()
-        logging.info("Database tables created or verified.")
+class BackgroundTask(db.Model): # New Model
+    __tablename__ = 'background_task'
+    id = Column(Integer, primary_key=True)
+    name = Column(String(100), nullable=False)
+    status = Column(String(50), default="pending") # e.g., pending, in_progress, completed, failed
+    result = Column(Text, nullable=True)
+    created_at = Column(DateTime(timezone=True), server_default=func.now())
+    updated_at = Column(DateTime(timezone=True), onupdate=func.now())
+    agent_profile_id = Column(Integer, ForeignKey('agent_profile.id'), nullable=True) # Link to agent if needed
 
-        if not AgentProfile.query.filter_by(name='General Assistant').first():
-            general_profile = AgentProfile(
-                name='General Assistant',
-                system_prompt_template="""You are a helpful AI assistant.
-                Available tools: {tool_schemas}
-                Respond concisely and accurately. If using a tool, explain which tool and why.
-                If a tool fails, report the error. If a tool succeeds, summarize the result.
-                """,
-                description='A general-purpose AI assistant capable of using various tools.'
-            )
-            db.session.add(general_profile)
-            logging.info("Added 'General Assistant' profile.")
+# --- Pydantic Models for API validation ---
+class Message(BaseModel): # Moved from script, standard Pydantic model
+    role: str
+    content: str
+    tool_calls: Optional[List[Dict[str, Any]]] = None
 
-        if not AgentProfile.query.filter_by(name='Code Reviewer').first():
-            code_profile = AgentProfile(
-                name='Code Reviewer',
-                system_prompt_template="""You are a meticulous code reviewer.
-                Available tools: {tool_schemas}
-                Focus on code quality, best practices, potential bugs, and efficiency.
-                Provide code examples when necessary.
-                If using a tool for analysis, explain its findings.
-                """,
-                description='Specializes in code analysis and review, can use tools for file operations.'
-            )
-            db.session.add(code_profile)
-            logging.info("Added 'Code Reviewer' profile.")
+# --- Tool Discovery (from agent_core.py) ---
+def discover_tools(module_or_object: Any) -> List[Dict[str, Any]]:
+    """
+    Discovers tools (functions with Pydantic schemas) in a given module or object.
+    """
+    discovered_tools = []
+    for name, func in inspect.getmembers(module_or_object, inspect.isfunction):
+        if hasattr(func, 'tool_schema'):
+            schema = func.tool_schema.schema()
+            discovered_tools.append({
+                "type": "function",
+                "function": {
+                    "name": name,
+                    "description": schema.get("description", ""),
+                    "parameters": schema
+                }
+            })
+    return discovered_tools
 
-        default_profile = AgentProfile.query.filter_by(is_default=True).first()
-        if not default_profile:
-            ga_profile = AgentProfile.query.filter_by(name='General Assistant').first()
-            if ga_profile:
-                ga_profile.is_default = True
-                logging.info("Set 'General Assistant' as default profile.")
-        db.session.commit()
+# --- Built-in Tools ---
+class SetAgentStateSchema(BaseModel):
+    key: str = Field(..., description="The key of the state variable to set.")
+    value: Any = Field(..., description="The value to set for the state variable.")
 
-# --- Ollama Interaction ---
-def call_ollama_chat_api(model_name: str, system_prompt: str, user_prompt: str, conversation_history: list):
-    ollama_url = os.getenv("OLLAMA_API_BASE_URL", "http://localhost:11434") + "/api/chat"
-
-    messages = [{"role": "system", "content": system_prompt}]
-    for msg in conversation_history: # Assumes history is correctly formatted
-        messages.append({"role": msg['sender'], "content": msg['text']})
-    messages.append({"role": "user", "content": user_prompt})
-
-    payload = {
-        "model": model_name,
-        "messages": messages,
-        "stream": False,
-        "options": { # Example options, adjust as needed
-            "temperature": 0.7,
-            "top_p": 0.9
-        }
-    }
-    logging.debug(f"Ollama payload: {json.dumps(payload, indent=2)}")
-
+def set_agent_state_tool(key: str, value: Any) -> str:
+    """Sets a value in the agent's state."""
     try:
-        response = requests.post(ollama_url, json=payload, timeout=180) # Increased timeout
-        response.raise_for_status()
-        ollama_response_data = response.json()
-
-        ai_message_content = ollama_response_data.get('message', {}).get('content', 'No content from AI.')
-
-        # Log usage details (optional, but good for debugging)
-        if 'total_duration' in ollama_response_data and 'prompt_eval_count' in ollama_response_data:
-            logging.info(
-                f"Ollama call successful for model '{model_name}'. "
-                f"Duration: {ollama_response_data['total_duration']/1e9:.2f}s. "
-                f"Prompt tokens: {ollama_response_data['prompt_eval_count']}. "
-                f"Response tokens: {ollama_response_data.get('eval_count',0)}."
-            )
-        return ai_message_content
-
-    except requests.exceptions.RequestException as e:
-        logging.error(f"Ollama request failed: {e}")
-        return f"ERROR: AI service request failed: {e}"
-    except json.JSONDecodeError:
-        logging.error(f"Invalid JSON response from Ollama for model {model_name}. Response: {response.text}")
-        return "ERROR: Invalid response from AI service."
-    except Exception as e:
-        logging.error(f"Unexpected error during Ollama call: {e}")
-        return f"ERROR: Unexpected AI error: {e}"
-
-
-# --- Flask Routes ---
-@app.route('/')
-def hello_world():
-    return 'Hello from PSI Agent Backend!'
-
-@app.route('/api/chat', methods=['POST'])
-def chat():
-    data = request.get_json()
-    user_message_text = data.get('message', '').strip()
-    profile_id = data.get('profile_id') # Allow client to specify profile
-
-    if not user_message_text:
-        return jsonify({"error": "Empty message received."}), 400
-
-    # --- Profile Selection ---
-    active_profile = None
-    if profile_id:
-        active_profile = AgentProfile.query.get(profile_id)
-    if not active_profile:
-        active_profile = AgentProfile.query.filter_by(is_default=True).first()
-    if not active_profile: # Fallback if database is empty or no default
-        logging.error("No active or default agent profile found. Chat functionality may be impaired.")
-        # Create a temporary emergency profile
-        system_prompt_for_chat = "You are a helpful AI assistant. No tools are available at the moment."
-        profile_name_for_log = "Emergency Fallback Profile"
-    else:
-        profile_name_for_log = active_profile.name
-        # Format the system prompt with available tool schemas
-        formatted_tool_schemas = json.dumps(AVAILABLE_TOOL_SCHEMAS, indent=2)
-        system_prompt_for_chat = active_profile.system_prompt_template.format(tool_schemas=formatted_tool_schemas)
-
-    logging.info(f"Using agent profile: {profile_name_for_log}")
-
-    # --- Store User Message ---
-    user_msg_db = Message(sender='user', text=user_message_text)
-    db.session.add(user_msg_db)
-    db.session.commit()
-
-    # --- Prepare Conversation History for Ollama ---
-    # Retrieve last N messages for context, could be made configurable
-    # For now, let's keep it simple and send only the current user message after the system prompt
-    # More advanced history management can be added later.
-    # For tool use, history might be more critical.
-    ollama_history = [] # Example: [{'sender': 'user', 'text': 'previous_message'}, {'sender': 'assistant', 'text': 'previous_response'}]
-    # For now, we'll let the system prompt and current user message drive the conversation.
-    # A more sophisticated approach would fetch and format recent Message objects.
-
-
-    # --- Initial Orchestrator Call ---
-    # The orchestrator decides if a tool is needed or can respond directly.
-    # For simplicity, the orchestrator prompt is the same as the chat system prompt for now.
-    # A more advanced orchestrator would have its own meta-prompt.
-
-    orchestrator_model = os.getenv("OLLAMA_ORCHESTRATOR_MODEL", "mistral") # e.g., mistral, or a fine-tuned model
-    logging.info(f"Orchestrator model: {orchestrator_model}")
-
-    # The user prompt to the orchestrator LLM includes instructions to choose a tool or respond.
-    # This is a simplified version. A more robust version would use a specific orchestrator prompt.
-    orchestrator_user_prompt = f"""
-User's message: "{user_message_text}"
-
-Based on the user's message and the available tools (schemas provided in the system prompt),
-decide if a tool needs to be called or if you can respond directly.
-
-Your response MUST be a JSON object.
-If a tool is needed, structure it like this:
-{{
-  "action_type": "tool_call",
-  "tool_name": "name_of_the_tool_function",
-  "tool_args": {{ "arg1": "value1", "arg2": "value2" }}
-}}
-(Ensure 'tool_name' matches one of the available tools: {', '.join(AVAILABLE_TOOLS_FUNCTIONS.keys())})
-
-If you can respond directly without a tool, structure it like this:
-{{
-  "action_type": "direct_response",
-  "response_text": "Your answer here."
-}}
-
-Do NOT add any text outside this JSON object.
-"""
-
-    logging.info("Phase 1: Orchestrator decision making.")
-    orchestrator_response_raw = call_ollama_chat_api(
-        orchestrator_model,
-        system_prompt_for_chat, # System prompt includes tool schemas
-        orchestrator_user_prompt,
-        ollama_history # Pass relevant history for context
-    )
-
-    ai_response_text = ""
-    agent_action_log = "orchestrator_decision"
-    tool_input_log = None
-    tool_output_log = None
-
-    try:
-        decision_data = json.loads(orchestrator_response_raw)
-        action_type = decision_data.get("action_type")
-        logging.info(f"Orchestrator decision: {action_type}")
-
-        if action_type == "tool_call":
-            tool_name = decision_data.get("tool_name")
-            tool_args = decision_data.get("tool_args", {})
-            tool_input_log = json.dumps(tool_args)
-            agent_action_log = f"tool_{tool_name}"
-
-            if tool_name in AVAILABLE_TOOLS_FUNCTIONS:
-                tool_func = AVAILABLE_TOOLS_FUNCTIONS[tool_name]
-                logging.info(f"Executing tool: {tool_name} with args: {tool_args}")
-
-                # Log system message about tool usage
-                tool_system_msg = Message(sender='system-info', text=f"Using tool: {tool_name} with input: {json.dumps(tool_args)}", agent_action=f"tool_call_{tool_name}", tool_input=tool_input_log)
-                db.session.add(tool_system_msg)
-                db.session.commit()
-
-                try:
-                    tool_result = tool_func(**tool_args) # Execute the tool
-                    tool_output_log = json.dumps(tool_result)
-                    logging.info(f"Tool '{tool_name}' result: {tool_result}")
-
-                    # Log tool result message
-                    tool_result_msg = Message(sender='tool-result', text=f"Tool {tool_name} output: {json.dumps(tool_result)}", agent_action=f"tool_result_{tool_name}", tool_output=tool_output_log)
-                    db.session.add(tool_result_msg)
-                    db.session.commit()
-
-                    # Phase 2: LLM call to formulate response based on tool output
-                    # This prompt asks the LLM to interpret the tool's output for the user.
-                    formulation_user_prompt = f"""
-The user's original message was: "{user_message_text}"
-You decided to use the tool '{tool_name}' with arguments {json.dumps(tool_args)}.
-The tool returned the following output:
-{json.dumps(tool_result)}
-
-Based on this, formulate a helpful and informative response to the user.
-If the tool was successful, explain what it did and the result.
-If the tool seems to have failed or returned an error, inform the user clearly but politely.
-"""
-                    logging.info("Phase 2: Formulating response after tool execution.")
-                    ai_response_text = call_ollama_chat_api(
-                        os.getenv("OLLAMA_CHAT_MODEL", "mistral"), # Use general chat model here
-                        system_prompt_for_chat, # Original system prompt
-                        formulation_user_prompt,
-                        ollama_history # Could include user_msg + orchestrator decision + tool_result
-                    )
-                except Exception as e:
-                    logging.error(f"Error executing tool {tool_name} or processing its result: {e}")
-                    ai_response_text = f"An error occurred while executing tool {tool_name}: {e}"
-                    tool_output_log = json.dumps({"error": str(e), "tool_name": tool_name})
-                    # Log error tool result
-                    tool_error_msg = Message(sender='tool-result', text=f"Tool {tool_name} error: {str(e)}", agent_action=f"tool_error_{tool_name}", tool_output=tool_output_log)
-                    db.session.add(tool_error_msg)
-                    db.session.commit()
-
-
-            else:
-                logging.warning(f"Orchestrator requested unknown tool: '{tool_name}'. Responding directly.")
-                ai_response_text = f"I tried to use a tool called '{tool_name}', but I don't have it. I'll try to answer directly."
-                # Fallback to direct response if tool is unknown
-                # (This part could be refined, maybe another LLM call or a standard message)
-                ai_response_text = call_ollama_chat_api(
-                    os.getenv("OLLAMA_CHAT_MODEL", "mistral"), system_prompt_for_chat, user_message_text, ollama_history
-                )
-                agent_action_log = "unknown_tool_fallback"
-
-        elif action_type == "direct_response":
-            ai_response_text = decision_data.get("response_text", "I'm not sure how to respond to that yet.")
-            agent_action_log = "direct_response"
-            logging.info(f"Orchestrator chose direct response: {ai_response_text[:100]}...")
-
+        state_item = AgentState.query.filter_by(key=key).first()
+        if state_item:
+            state_item.value = value
         else:
-            logging.error(f"Orchestrator gave unhandled action_type: '{action_type}'. Raw: {orchestrator_response_raw}")
-            ai_response_text = "I received an unexpected decision from my internal processing. I'll try to answer directly."
-            # Fallback to direct response
-            ai_response_text = call_ollama_chat_api(
-                 os.getenv("OLLAMA_CHAT_MODEL", "mistral"), system_prompt_for_chat, user_message_text, ollama_history
-            )
-            agent_action_log = "unhandled_action_fallback"
-
-    except json.JSONDecodeError:
-        logging.error(f"Failed to parse orchestrator JSON response: {orchestrator_response_raw}")
-        ai_response_text = "My decision-making process (orchestrator) returned an invalid format. I'll try to answer directly."
-        # Fallback to direct response
-        ai_response_text = call_ollama_chat_api(
-             os.getenv("OLLAMA_CHAT_MODEL", "mistral"), system_prompt_for_chat, user_message_text, ollama_history
-        )
-        agent_action_log = "orchestrator_json_error_fallback"
-    except Exception as e:
-        logging.error(f"Error processing orchestrator response or executing action: {e}")
-        ai_response_text = f"An unexpected error occurred: {e}. I'll try to answer directly."
-        # Fallback to direct response
-        ai_response_text = call_ollama_chat_api(
-            os.getenv("OLLAMA_CHAT_MODEL", "mistral"), system_prompt_for_chat, user_message_text, ollama_history
-        )
-        agent_action_log = "orchestrator_exception_fallback"
-
-    # --- Store AI Response ---
-    ai_msg_db = Message(
-        sender='ai',
-        text=ai_response_text,
-        agent_action=agent_action_log,
-        tool_input=tool_input_log,
-        tool_output=tool_output_log
-    )
-    db.session.add(ai_msg_db)
-    db.session.commit()
-
-    logging.info(f"Final AI Response (action: {agent_action_log}): {ai_response_text[:100]}...")
-
-    return jsonify({
-        "response": ai_response_text,
-        "agent_action": agent_action_log,
-        "profile_name": profile_name_for_log,
-        "tool_input": tool_input_log,
-        "tool_output": tool_output_log
-    }), 200
-
-
-@app.route('/api/history', methods=['GET'])
-def get_history():
-    try:
-        limit = request.args.get('limit', 100, type=int)
-        messages = Message.query.order_by(Message.timestamp.asc()).limit(limit).all()
-        return jsonify([msg.to_dict() for msg in messages]), 200
-    except Exception as e:
-        logging.error(f"Error fetching history: {e}")
-        return jsonify({"error": "Failed to fetch history", "details": str(e)}), 500
-
-@app.route('/api/profiles', methods=['GET'])
-def get_profiles_route():
-    try:
-        profiles = AgentProfile.query.all()
-        current_profile_id = session.get('current_profile_id') # Assuming session might store this
-        active_profile = AgentProfile.query.filter_by(is_default=True).first()
-
-        # If current_profile_id is not in session, use the default profile's ID
-        if not current_profile_id and active_profile:
-            current_profile_id = active_profile.id
-
-        return jsonify({
-            "profiles": [p.to_dict() for p in profiles],
-            "current_profile_id": current_profile_id, # ID of the currently active/default profile
-            "default_profile_id": active_profile.id if active_profile else None
-        }), 200
-    except Exception as e:
-        logging.error(f"Error fetching profiles: {e}")
-        return jsonify({"error": "Failed to fetch profiles", "details": str(e)}), 500
-
-@app.route('/api/set_profile', methods=['POST'])
-def set_profile_route():
-    data = request.get_json()
-    profile_id = data.get('profile_id')
-    if not profile_id:
-        return jsonify({"error": "profile_id is required"}), 400
-
-    new_default_profile = AgentProfile.query.get(profile_id)
-    if not new_default_profile:
-        return jsonify({"error": "Profile not found"}), 404
-
-    try:
-        # Unset current default
-        current_default = AgentProfile.query.filter_by(is_default=True).first()
-        if current_default:
-            current_default.is_default = False
-            db.session.add(current_default)
-
-        # Set new default
-        new_default_profile.is_default = True
-        db.session.add(new_default_profile)
+            state_item = AgentState(key=key, value=value)
+            db.session.add(state_item)
         db.session.commit()
-
-        session['current_profile_id'] = new_default_profile.id # Optional: update session
-        logging.info(f"Default agent profile changed to: {new_default_profile.name}")
-        return jsonify({"message": f"Default profile set to {new_default_profile.name}.", "current_profile": new_default_profile.to_dict()}), 200
+        return f"State variable '{key}' set successfully."
     except Exception as e:
         db.session.rollback()
-        logging.error(f"Error setting profile: {e}")
-        return jsonify({"error": "Failed to set profile", "details": str(e)}), 500
+        return f"Error setting state variable '{key}': {str(e)}"
+set_agent_state_tool.tool_schema = SetAgentStateSchema
 
+class GetAgentStateSchema(BaseModel):
+    key: str = Field(..., description="The key of the state variable to retrieve.")
 
-# --- Main Execution ---
-if __name__ == '__main__':
-    with app.app_context():
-        init_db() # Initialize DB and add default profiles
+def get_agent_state_tool(key: str) -> Any:
+    """Retrieves a value from the agent's state."""
+    state_item = AgentState.query.filter_by(key=key).first()
+    if state_item:
+        return state_item.value
+    else:
+        return f"State variable '{key}' not found."
+get_agent_state_tool.tool_schema = GetAgentStateSchema
 
-    # Pre-pull models (optional, good for first run)
-    # Consider moving to a startup script or Dockerfile
-    ollama_check_url = os.getenv("OLLAMA_API_BASE_URL", "http://localhost:11434")
+# --- RAG Tool ---
+KNOWLEDGE_BASE_PATH = 'knowledge_base' # Defined as per instructions
+
+class RetrieveFromKnowledgeBaseSchema(BaseModel):
+    query: str = Field(..., description="The query to search for in the knowledge base.")
+    top_k: int = Field(default=3, description="Number of top results to retrieve.")
+
+def retrieve_from_knowledge_base(query: str, top_k: int = 3) -> List[str]:
+    """
+    Retrieves relevant chunks from the knowledge base using Ollama embeddings.
+    """
+    if not os.path.exists(KNOWLEDGE_BASE_PATH):
+        return ["Knowledge base directory not found."]
+
+    all_chunks = []
+    for filename in os.listdir(KNOWLEDGE_BASE_PATH):
+        if filename.endswith(".txt"): # Assuming knowledge is stored in .txt files
+            filepath = os.path.join(KNOWLEDGE_BASE_PATH, filename)
+            with open(filepath, 'r', encoding='utf-8') as f:
+                content = f.read()
+                # Simple chunking by paragraph, can be improved
+                paragraphs = content.split('\n\n')
+                for para_idx, para in enumerate(paragraphs):
+                    if para.strip():
+                         all_chunks.append({"text": para.strip(), "source": filename, "paragraph": para_idx})
+
+    if not all_chunks:
+        return ["No content found in the knowledge base."]
+
+    # Generate embeddings for all chunks
+    chunk_embeddings = []
+    for chunk in all_chunks:
+        try:
+            response = ollama.embeddings(model='mxbai-embed-large', prompt=chunk["text"])
+            chunk_embeddings.append({"chunk": chunk, "embedding": response['embedding']})
+        except Exception as e:
+            print(f"Error generating embedding for chunk from {chunk['source']}: {e}")
+            continue
+
+    if not chunk_embeddings:
+        return ["Could not generate embeddings for knowledge base content."]
+
+    # Generate embedding for the query
     try:
-        requests.get(ollama_check_url, timeout=5) # Check if Ollama is running
-        logging.info("Ollama service detected. Checking/pulling models...")
-        # Models to pre-pull - make these configurable via environment variables
-        orchestrator_model_name = os.getenv("OLLAMA_ORCHESTRATOR_MODEL", "mistral")
-        chat_model_name = os.getenv("OLLAMA_CHAT_MODEL", "mistral")
-
-        # Using os.system for simplicity, subprocess is generally safer/more flexible
-        if os.system(f"ollama pull {orchestrator_model_name}") != 0:
-             logging.warning(f"Could not pre-pull orchestrator model '{orchestrator_model_name}'. Ensure Ollama is running and the model is valid.")
-        else:
-            logging.info(f"Orchestrator model '{orchestrator_model_name}' is available.")
-
-        if orchestrator_model_name != chat_model_name: # Avoid pulling same model twice
-            if os.system(f"ollama pull {chat_model_name}") != 0:
-                logging.warning(f"Could not pre-pull chat model '{chat_model_name}'.")
-            else:
-                logging.info(f"Chat model '{chat_model_name}' is available.")
-        else:
-            logging.info(f"Chat model is the same as orchestrator model ('{chat_model_name}'), no separate pull needed.")
-
-    except requests.exceptions.ConnectionError:
-        logging.warning(f"Ollama service not reachable at {ollama_check_url}. Cannot pre-pull models. Please ensure Ollama is running.")
+        query_embedding_response = ollama.embeddings(model='mxbai-embed-large', prompt=query)
+        query_embedding = query_embedding_response['embedding']
     except Exception as e:
-        logging.error(f"An error occurred during model pre-pull check: {e}")
+        return [f"Error generating embedding for query: {str(e)}"]
 
-    app.run(host='0.0.0.0', port=5000, debug=os.getenv('FLASK_DEBUG', 'False').lower() == 'true')
+    # Calculate similarity (cosine similarity)
+    # Note: ollama client doesn't provide a direct similarity function.
+    # This requires numpy or similar for efficient dot product. For simplicity,
+    # we'll skip the actual math here and return a placeholder.
+    # In a real scenario, you'd use numpy:
+    # import numpy as np
+    # similarities = [np.dot(ce["embedding"], query_embedding) / (np.linalg.norm(ce["embedding"]) * np.linalg.norm(query_embedding)) for ce in chunk_embeddings]
+    # For now, just returning the first few chunks as a mock retrieval
+
+    # Mocking similarity scoring and ranking for now
+    # Replace with actual cosine similarity calculation if numpy is available
+    # For demonstration, we'll just return the text of the first few chunks
+
+    # Simulate relevance scoring (replace with actual cosine similarity if numpy is added)
+    # This is a simplified example. Real RAG needs proper similarity calculation.
+    # We will return chunks that contain words from the query for this example.
+
+    relevant_chunks = []
+    query_words = set(query.lower().split())
+    for ce in chunk_embeddings:
+        chunk_text_lower = ce["chunk"]["text"].lower()
+        # Basic keyword matching for demonstration
+        if any(word in chunk_text_lower for word in query_words):
+            relevant_chunks.append(ce["chunk"])
+            if len(relevant_chunks) >= top_k:
+                break
+
+    if not relevant_chunks:
+        return ["No relevant information found for your query."]
+
+    return [f"Source: {chunk['source']}, Paragraph {chunk['paragraph']}: {chunk['text']}" for chunk in relevant_chunks[:top_k]]
+
+retrieve_from_knowledge_base.tool_schema = RetrieveFromKnowledgeBaseSchema
+
+
+# --- Background Task Management ---
+def create_background_task(name: str, agent_profile_id: Optional[int] = None) -> BackgroundTask:
+    new_task = BackgroundTask(name=name, agent_profile_id=agent_profile_id)
+    db.session.add(new_task)
+    db.session.commit()
+    return new_task
+
+def update_background_task(task_id: int, status: str, result: Optional[str] = None):
+    task = BackgroundTask.query.get(task_id)
+    if task:
+        task.status = status
+        if result is not None:
+            task.result = result
+        task.updated_at = func.now()
+        db.session.commit()
+
+def simulate_long_running_process(task_id: int, duration: int):
+    update_background_task(task_id, status="in_progress")
+    print(f"Task {task_id}: Starting long running process for {duration} seconds.")
+    time.sleep(duration) # Simulate work
+    result_message = f"Task {task_id} completed after {duration} seconds."
+    update_background_task(task_id, status="completed", result=result_message)
+    print(result_message)
+
+
+# --- Core Ollama Call Function ---
+def call_ollama(model: str, messages: List[Dict[str, Any]], stream: bool = False, tools: Optional[List[Dict[str, Any]]] = None) -> Union[Dict[str, Any], Any]:
+    """
+    Calls the Ollama API with the given model, messages, and optional tools.
+    Handles streaming and non-streaming responses.
+    """
+    options = {
+        "temperature": 0.8, # Example option
+        # "top_p": 0.9,
+        # "num_ctx": 4096 # Example, adjust as needed
+    }
+    try:
+        if tools:
+            response = ollama.chat(
+                model=model,
+                messages=messages,
+                tools=tools,
+                stream=stream,
+                options=options
+            )
+        else:
+            response = ollama.chat(
+                model=model,
+                messages=messages,
+                stream=stream,
+                options=options
+            )
+        return response
+    except Exception as e:
+        print(f"Error calling Ollama: {e}")
+        # Fallback or error handling:
+        # Check if it's a model not found error, try a default model
+        if "model not found" in str(e).lower() and model != "llama3":
+            print(f"Model {model} not found, trying with llama3...")
+            try:
+                if tools:
+                    response = ollama.chat(model='llama3', messages=messages, tools=tools, stream=stream, options=options)
+                else:
+                    response = ollama.chat(model='llama3', messages=messages, stream=stream, options=options)
+                return response
+            except Exception as e2:
+                print(f"Error calling Ollama with fallback model llama3: {e2}")
+                return {"error": str(e2), "message": "Failed to call Ollama with primary and fallback models."}
+
+        return {"error": str(e), "message": "Failed to call Ollama."}
+
+
+# --- API Routes ---
+@app.route('/')
+def serve_frontend():
+    return send_from_directory('../frontend/static', 'index.html')
+
+@app.route('/<path:path>')
+def serve_static_files(path):
+    return send_from_directory('../frontend/static', path)
+
+@app.route('/api/chat', methods=['POST'])
+def chat_endpoint():
+    data = request.json
+    user_message_content = data.get('message')
+    chat_history: List[Dict[str, Any]] = data.get('history', [])
+    selected_model = data.get('model', 'llama3') # Default to llama3 if not specified
+
+    # Get current agent profile (assuming one for now)
+    agent_profile = AgentProfile.query.first()
+    if not agent_profile:
+        return jsonify({"error": "Agent profile not found. Please initialize."}), 500
+
+    # Construct messages for Ollama
+    messages = [{"role": "system", "content": agent_profile.persona}]
+    messages.extend(chat_history)
+    messages.append({"role": "user", "content": user_message_content})
+
+    # Discover available tools
+    # Tool functions should be defined globally or in an imported module
+    available_tools_definitions = discover_tools(globals()) # Pass current module
+    # Or, if tools are in a specific class/object:
+    # from agent_tools import MyAgentTools
+    # available_tools_definitions = discover_tools(MyAgentTools)
+
+    # --- Advanced Orchestrator Logic ---
+    MAX_TOOL_ITERATIONS = 5
+    for _ in range(MAX_TOOL_ITERATIONS):
+        print(f"Iteration {_ + 1}: Sending messages to Ollama: {messages}")
+        if not available_tools_definitions: # If no tools, simple chat
+             print("No tools defined for the agent. Proceeding with simple chat.")
+             response = call_ollama(model=selected_model, messages=messages)
+             if response and response.get('message'):
+                return jsonify(response['message'])
+             else:
+                return jsonify({"error": "Failed to get response from Ollama", "details": response}), 500
+
+        response = call_ollama(model=selected_model, messages=messages, tools=available_tools_definitions)
+
+        if response and response.get('error'):
+            return jsonify(response), 500
+
+        if not response or 'message' not in response:
+             print(f"No 'message' in Ollama response: {response}")
+             return jsonify({"error": "Invalid response from Ollama", "details": response}), 500
+
+        ai_message = response['message']
+        messages.append(ai_message) # Add AI's response to history
+
+        if ai_message.get('tool_calls'):
+            tool_calls = ai_message['tool_calls']
+            tool_results = []
+
+            for tool_call in tool_calls:
+                tool_name = tool_call['function']['name']
+                tool_args_str = tool_call['function']['arguments']
+
+                print(f"Tool call: {tool_name}, Args_str: {tool_args_str}")
+
+                try:
+                    tool_args = json.loads(tool_args_str)
+                except json.JSONDecodeError as e:
+                    print(f"Error decoding JSON arguments for tool {tool_name}: {e}")
+                    print(f"Problematic string: {tool_args_str}")
+                    tool_results.append({
+                        "tool_call_id": tool_call['id'],
+                        "output": f"Error: Invalid JSON arguments provided: {tool_args_str}"
+                    })
+                    continue # Skip to next tool call
+
+                # Dynamically call the tool function
+                tool_function = globals().get(tool_name)
+                if tool_function and callable(tool_function):
+                    try:
+                        print(f"Executing tool: {tool_name} with args: {tool_args}")
+                        # Ensure all required arguments are present
+                        sig = inspect.signature(tool_function)
+                        missing_args = [p for p in sig.parameters if p not in tool_args and sig.parameters[p].default == inspect.Parameter.empty]
+                        if missing_args:
+                             result = f"Error: Missing required arguments for tool {tool_name}: {', '.join(missing_args)}"
+                        else:
+                            result = tool_function(**tool_args)
+
+                        # If the result is not a string, convert it (e.g., for get_agent_state_tool)
+                        if not isinstance(result, str):
+                            result = json.dumps(result)
+
+                    except Exception as e:
+                        result = f"Error executing tool {tool_name}: {str(e)}"
+                    print(f"Tool {tool_name} result: {result}")
+                else:
+                    result = f"Error: Tool '{tool_name}' not found or not callable."
+
+                tool_results.append({
+                    "tool_call_id": tool_call['id'],
+                    "output": result
+                })
+
+            # Add tool results to messages for the next iteration
+            messages.append({
+                "role": "tool",
+                "content": json.dumps(tool_results) # Ensure content is a JSON string
+            })
+            # Continue to the next iteration of the loop to let the LLM process tool results
+
+        else: # No tool calls, AI response is final for this turn
+            return jsonify(ai_message)
+
+    # If loop finishes, it means max iterations were hit
+    return jsonify({"role": "assistant", "content": "Max tool iterations reached. Please try again or rephrase your request."})
+
+
+@app.route('/api/agent/profile', methods=['GET', 'POST'])
+def agent_profile_route():
+    if request.method == 'GET':
+        profile = AgentProfile.query.first()
+        if profile:
+            return jsonify({
+                "name": profile.name,
+                "persona": profile.persona,
+                "tools": profile.tools,
+                "state": profile.state
+            })
+        return jsonify({"message": "Profile not set"}), 404
+
+    if request.method == 'POST':
+        data = request.json
+        profile = AgentProfile.query.first()
+        if not profile:
+            profile = AgentProfile()
+            db.session.add(profile)
+
+        profile.name = data.get('name', profile.name)
+        profile.persona = data.get('persona', profile.persona)
+        profile.tools = data.get('tools', profile.tools) # Expecting list of tool definitions
+        profile.state = data.get('state', profile.state) # Update agent state
+        profile.updated_at = func.now()
+        db.session.commit()
+        return jsonify({"message": "Profile updated successfully"})
+
+# New API endpoint for background tasks
+@app.route('/api/tasks', methods=['GET', 'POST'])
+def manage_tasks():
+    if request.method == 'GET':
+        tasks = BackgroundTask.query.all()
+        return jsonify([{
+            "id": task.id,
+            "name": task.name,
+            "status": task.status,
+            "result": task.result,
+            "created_at": task.created_at.isoformat() if task.created_at else None,
+            "updated_at": task.updated_at.isoformat() if task.updated_at else None
+        } for task in tasks])
+
+    if request.method == 'POST':
+        data = request.json
+        task_name = data.get('name', 'Unnamed Task')
+        duration = data.get('duration', 10) # Duration for simulated task
+
+        # Example: Create a task and run it in a background thread
+        new_task = create_background_task(name=task_name)
+
+        # Start the simulation in a new thread
+        thread = threading.Thread(target=simulate_long_running_process, args=(new_task.id, duration))
+        thread.start()
+
+        return jsonify({"message": "Task created and started", "task_id": new_task.id}), 201
+
+@app.route('/api/tasks/<int:task_id>', methods=['GET'])
+def get_task_status(task_id):
+    task = BackgroundTask.query.get(task_id)
+    if task:
+        return jsonify({
+            "id": task.id,
+            "name": task.name,
+            "status": task.status,
+            "result": task.result,
+            "created_at": task.created_at.isoformat() if task.created_at else None,
+            "updated_at": task.updated_at.isoformat() if task.updated_at else None
+        })
+    return jsonify({"message": "Task not found"}), 404
+
+# New API endpoint for general config (e.g., available models)
+@app.route('/api/config', methods=['GET'])
+def get_config():
+    try:
+        # Fetch available local models from Ollama
+        ollama_models = ollama.list()
+        local_model_names = [model['name'] for model in ollama_models.get('models', [])]
+    except Exception as e:
+        print(f"Could not connect to Ollama to fetch models: {e}")
+        local_model_names = ["llama3 (default, if Ollama offline)"] # Fallback
+
+    return jsonify({
+        "available_models": local_model_names,
+        "knowledge_base_path": app.config['KNOWLEDGE_BASE_PATH'],
+        "upload_folder": app.config['UPLOAD_FOLDER']
+    })
+
+
+# --- Initialization ---
+def init_db(app_context):
+    with app_context:
+        db.create_all()
+        # Create default agent profile if it doesn't exist
+        if not AgentProfile.query.first():
+            default_tools = discover_tools(globals()) # Discover all tools in current scope
+            # Filter out tools that are not meant for the agent directly if necessary
+            # For now, add all discovered tools
+            profile = AgentProfile(
+                name="Monarch Agent",
+                persona="You are Monarch, a helpful AI assistant specializing in software development and task automation. You have access to a variety of tools to help users. Be concise and proactive.",
+                tools=default_tools, # Store discovered tools
+                state={"greeting_enabled": True} # Example initial state
+            )
+            db.session.add(profile)
+            db.session.commit()
+            print("Default agent profile created.")
+
+        # Ensure knowledge base and upload directories exist
+        if not os.path.exists(app.config['KNOWLEDGE_BASE_PATH']):
+            os.makedirs(app.config['KNOWLEDGE_BASE_PATH'])
+            print(f"Created knowledge base directory: {app.config['KNOWLEDGE_BASE_PATH']}")
+        if not os.path.exists(app.config['UPLOAD_FOLDER']):
+            os.makedirs(app.config['UPLOAD_FOLDER'])
+            print(f"Created upload folder: {app.config['UPLOAD_FOLDER']}")
+
+if __name__ == '__main__':
+    init_db(app.app_context())
+    app.run(debug=True, port=5001, host='0.0.0.0')
