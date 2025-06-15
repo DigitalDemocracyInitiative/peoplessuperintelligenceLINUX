@@ -2,3 +2,5 @@ Flask
 flask-cors
 gunicorn
 requests
+SQLAlchemy
+Flask-SQLAlchemy
