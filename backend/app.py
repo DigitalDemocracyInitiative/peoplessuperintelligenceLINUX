@@ -40,6 +40,21 @@ init_db() # Initialize the database
 
 CORS(app) # Enable CORS for all routes
 
+def document_processing_tool(document_text: str):
+    """Processes the given document text for simple analysis."""
+    if not isinstance(document_text, str):
+        return {"tool_name": "document_processor", "success": False, "error": "Invalid input: Document text must be a string."}
+    if not document_text.strip():
+        return {"tool_name": "document_processor", "success": False, "error": "Invalid input: Document text cannot be empty."}
+
+    try:
+        word_count = len(document_text.split())
+        char_count = len(document_text)
+        result_summary = f"Document processed: {word_count} words, {char_count} characters."
+        return {"tool_name": "document_processor", "success": True, "result": result_summary}
+    except Exception as e:
+        return {"tool_name": "document_processor", "success": False, "error": f"Error during processing: {str(e)}"}
+
 # Helper function to call Ollama
 def call_ollama(model_name: str, prompt_text: str, conversation_history: list):
     ollama_url = "http://localhost:11434/api/generate"
@@ -211,17 +226,46 @@ def chat():
 
     # If not a file op, proceed with existing logic (document processing, LLM calls)
     # Simple intent detection (existing logic)
-    if user_message.lower().startswith("process document:"):
-        document_text = user_message.split(":", 1)[1].strip()
+    # The prompt mentions "process document" or "analyze text"
+    if user_message.lower().startswith("process document:") or user_message.lower().startswith("analyze text:"):
+        # DEBUG print mentioned in prompt, adding it here for consistency if it was intended.
+        # print("DEBUG: Agent identified a 'document processing' intent.")
+        if user_message.lower().startswith("process document:"):
+            document_text = user_message.split(":", 1)[1].strip()
+        else: # analyze text:
+            document_text = user_message.split(":", 1)[1].strip()
+
         if not document_text:
             # User message already saved, this is an error for the operation itself
-            return jsonify({"error": "Document text is empty after 'process document:' command."}), 400
+            # We can create a system message for this failure too.
+            ai_response_text = "Error: Document text is empty after command."
+            agent_action = "tool_failure" # More specific: "empty_document_input_failure"
+            system_msg_db = Message(sender='system-info', text=ai_response_text, agent_action=agent_action)
+            db.session.add(system_msg_db)
+            db.session.commit()
+            return jsonify({"error": "Document text is empty after command."}), 400
 
-        tool_output = {"result": f"Document processed. First 50 chars: {document_text[:50]}..."}
-        system_msg_db = Message(sender='system-info', text=f"Agent used document processing tool. Result: {tool_output['result']}", agent_action='tool_used_document_processing')
+        tool_output = document_processing_tool(document_text)
+        tool_details = tool_output # Store the full tool output
+
+        if tool_output.get("success"):
+            ai_response_text = f"Agent used document processing tool. Result: {tool_output['result']}"
+            agent_action = "tool_used"
+            status_code = 200
+        else:
+            ai_response_text = f"Agent failed to process document. Error: {tool_output.get('error', 'Unknown error')}"
+            agent_action = "tool_failure"
+            status_code = 400 # Or 500 if it's an internal tool error vs bad user input handled by the tool
+
+        system_msg_db = Message(sender='system-info', text=ai_response_text, agent_action=agent_action)
         db.session.add(system_msg_db)
         db.session.commit()
-        return jsonify({"response": tool_output['result'], "agent_action": "document_processed"}), 200
+        # The response to the client should be structured consistently.
+        # If success, client gets the result; if failure, client gets the error.
+        if tool_output.get("success"):
+            return jsonify({"response": tool_output['result'], "agent_action": agent_action}), status_code
+        else:
+            return jsonify({"error": tool_output.get('error', 'Unknown error'), "agent_action": agent_action}), status_code
 
     elif "code" in user_message.lower() or "deepseek-coder" in user_message.lower():
         model_to_use = "deepseek-coder"
