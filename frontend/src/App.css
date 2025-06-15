@@ -148,3 +148,79 @@
   color: white;
   border-left: 5px solid #a30000;
 }
+
+/* New styles for RAG and UI elements */
+.message.rag_success {
+  background-color: #007bff; /* Blue for successful RAG */
+  color: white;
+  border-left: 5px solid #0056b3;
+}
+
+.message.rag_failure {
+  background-color: #dc3545; /* Red for RAG failure */
+  color: white;
+  border-left: 5px solid #a30000;
+}
+
+.tools-list-container {
+    flex-grow: 1;
+    width: 30%; /* Adjust width for tools list */
+    max-width: 400px;
+    background-color: #333;
+    border: 1px solid #61dafb;
+    border-radius: 8px;
+    padding: 15px;
+    color: white;
+    min-height: 100px;
+}
+
+@media (max-width: 768px) {
+  .tools-list-container {
+    width: 90%; /* Full width on mobile */
+    max-width: none;
+  }
+}
+
+.tools-list-container h2 {
+    margin-top: 0;
+    color: #61dafb;
+    font-size: 1.2em;
+    border-bottom: 1px solid #61dafb;
+    padding-bottom: 10px;
+    margin-bottom: 15px;
+}
+
+.tools-list-container ul {
+    list-style: none;
+    padding: 0;
+}
+
+.tools-list-container li {
+    margin-bottom: 8px;
+    padding: 5px;
+    border-left: 3px solid #007bff;
+    background-color: #444;
+    border-radius: 4px;
+    font-size: 0.85em;
+}
+
+.tools-list-container strong {
+    color: #61dafb;
+}
+
+.App-loading {
+    display: flex;
+    flex-direction: column;
+    align-items: center;
+    justify-content: center;
+    min-height: 100vh;
+    background-color: #282c34;
+    color: white;
+    font-size: 1.5em;
+}
+
+.App-loading p {
+    font-size: 0.6em;
+    color: #aaa;
+    margin-top: 20px;
+}
