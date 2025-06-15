@@ -80,3 +80,71 @@
   background-color: #aaa;
   cursor: not-allowed;
 }
+
+/* Styling for Profile Selector */
+.profile-selector {
+  margin-top: 10px;
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  font-size: 0.9em;
+  color: #ddd;
+}
+
+.profile-selector label {
+  font-weight: bold;
+}
+
+.profile-selector select {
+  padding: 5px 8px;
+  border-radius: 5px;
+  border: 1px solid #555;
+  background-color: #333;
+  color: white;
+  cursor: pointer;
+}
+
+.profile-selector select:focus {
+  outline: none;
+  border-color: #007bff;
+  box-shadow: 0 0 0 2px rgba(0, 123, 255, 0.25);
+}
+
+.current-profile-display {
+  font-style: italic;
+  color: #aaa;
+}
+
+/* New agent action types for orchestration */
+.message.orchestrating {
+  background-color: #6c757d; /* Grey for general orchestration messages */
+  color: white;
+  font-size: 0.75em;
+  text-align: center;
+  padding: 3px;
+  margin: 2px 0;
+  border-radius: 3px;
+}
+
+.message.tool_selection, .message.llm_selection {
+  background-color: #007bff; /* Blue for selection messages */
+  color: white;
+  font-size: 0.75em;
+  text-align: center;
+  padding: 3px;
+  margin: 2px 0;
+  border-radius: 3px;
+}
+
+.message.orchestrator_direct {
+  background-color: #6f42c1; /* Purple for direct orchestrator responses */
+  color: white;
+  font-size: 0.85em;
+  border-left: 5px solid #4a0082;
+}
+
+.message.orchestration_error, .message.tool_failure {
+  background-color: #dc3545; /* Red for errors */
+  color: white;
+  border-left: 5px solid #a30000;
+}
